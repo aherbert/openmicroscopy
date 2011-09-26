@@ -98,6 +98,13 @@ public class ExporterI extends AbstractAmdServant implements
      * @see ticket:6520
      */
     private final static long BIG_TIFF_SIZE = 2L * Integer.MAX_VALUE;
+    
+    /**
+     * The size above which a tiff file should be written using a background
+     * thread. This is to avoid the thread overhead when small files are
+     * exported.
+     */
+    private final static long MULTI_THREAD_EXPORT_SIZE = 1024L * 1024;  // 1MB
 
 
     /**
@@ -357,6 +364,7 @@ public class ExporterI extends AbstractAmdServant implements
                             RawPixelsStore raw = null;
                             OmeroReader reader = null;
                             TiffWriter writer = null;
+                            BackgroundTiffWriter backgroundWriter = null;
                             try {
 
                                 Image image = retrieve.getImage(0);
@@ -387,6 +395,7 @@ public class ExporterI extends AbstractAmdServant implements
                                 long dSize = getDataBytes(reader);
                                 final boolean bigtiff =
                                     ( ( mSize + dSize ) > BIG_TIFF_SIZE );
+                                final boolean multiThread = ( dSize > MULTI_THREAD_EXPORT_SIZE );
                                 if (bigtiff) {
                                     writer.setBigTiff(true);
                                 }
@@ -397,19 +406,75 @@ public class ExporterI extends AbstractAmdServant implements
                                 log.info(String.format(
                                             "Using big TIFF? %s mSize=%d " +
                                             "dSize=%d planeCount=%d " +
-                                            "planeSize=%d",
+                                            "planeSize=%d multiThread=%s",
                                             bigtiff, mSize, dSize,
-                                            planeCount, planeSize));
-                                byte[] plane = new byte[planeSize];
-                                for (int i = 0; i < planeCount; i++) {
-                                    int[] zct = FormatTools.getZCTCoords(
-                                        retrieve.getPixelsDimensionOrder(0).getValue(),
-                                        reader.getSizeZ(), reader.getSizeC(), reader.getSizeT(),
-                                        planeCount, i);
-                                    int readerIndex = reader.getIndex(zct[0], zct[1], zct[2]);
-                                    reader.openBytes(readerIndex, plane);
-                                    writer.saveBytes(i, plane);
+                                            planeCount, planeSize,
+                                            multiThread));
+
+                                // Perform some debug timing for the export
+                                long start = System.nanoTime();
+                                long checkpoint1, checkpoint2;
+                                long openTime = 0, saveTime = 0, waitTime = 0;
+                                
+                                if (multiThread)
+                                {
+                                    // Save the image using a different thread
+                                    backgroundWriter = new BackgroundTiffWriter(writer, 10);
+                                    Thread thread = new Thread(backgroundWriter);
+                                    thread.start();
+                                    
+                                    for (int i = 0; i < planeCount; i++) {
+                                        int[] zct = FormatTools.getZCTCoords(
+                                            retrieve.getPixelsDimensionOrder(0).getValue(),
+                                            reader.getSizeZ(), reader.getSizeC(), reader.getSizeT(),
+                                            planeCount, i);
+                                        int readerIndex = reader.getIndex(zct[0], zct[1], zct[2]);
+                                        byte[] plane = new byte[planeSize];
+                                        checkpoint1 = System.nanoTime();
+                                        reader.openBytes(readerIndex, plane);
+                                        checkpoint2 = System.nanoTime();
+                                        openTime += checkpoint2 - checkpoint1;
+                                        backgroundWriter.saveBytes(plane);
+                                        checkpoint1 = System.nanoTime();
+                                        saveTime += checkpoint1 - checkpoint2;
+                                    }
+                                    
+                                    // Wait for background writer
+                                    checkpoint1 = System.nanoTime();
+                            		backgroundWriter.finalise();
+                                	thread.join();
+                                    waitTime = System.nanoTime() - checkpoint1;
                                 }
+                                else
+                                {
+                                    byte[] plane = new byte[planeSize];
+                                    
+                                    for (int i = 0; i < planeCount; i++) {
+                                        int[] zct = FormatTools.getZCTCoords(
+                                            retrieve.getPixelsDimensionOrder(0).getValue(),
+                                            reader.getSizeZ(), reader.getSizeC(), reader.getSizeT(),
+                                            planeCount, i);
+                                        int readerIndex = reader.getIndex(zct[0], zct[1], zct[2]);
+                                        checkpoint1 = System.nanoTime();
+                                        reader.openBytes(readerIndex, plane);
+                                        checkpoint2 = System.nanoTime();
+                                        openTime += checkpoint2 - checkpoint1;
+                                        writer.saveBytes(i, plane);
+                                        checkpoint1 = System.nanoTime();
+                                        saveTime += checkpoint1 - checkpoint2;
+                                    }
+                                }
+                                
+                                long end = System.nanoTime();
+                                String msg = String.format("Saved image %s in %f ms. open = %f ms. save = %f ms. wait = %f ms\n", 
+                                		retrieve.getImageName(0), 
+                                		(end-start) / 1000000.0, 
+                                		openTime / 1000000.0, 
+                                		saveTime / 1000000.0,
+                                		waitTime / 1000000.0);
+                                
+                                log.info(msg);
+
                                 retrieve = null;
 
                                 try {
@@ -418,7 +483,7 @@ public class ExporterI extends AbstractAmdServant implements
                                     // Nulling to prevent another exception
                                     writer = null;
                                 }
-
+                                
                                     __cb.ice_response(file.length());
                                 } catch (Exception e) {
                                     omero.InternalException ie = new omero.InternalException(
@@ -427,14 +492,15 @@ public class ExporterI extends AbstractAmdServant implements
                                     IceMapper.fillServerError(ie, e);
                                     __cb.ice_exception(ie);
                                 } finally {
-                                    cleanup(raw, reader, writer);
+                                    cleanup(raw, reader, writer, backgroundWriter);
                                 }
 
                             return null; // see calls to __cb above
                         }
 
                         private void cleanup(RawPixelsStore raw,
-                                OmeroReader reader, IFormatWriter writer) {
+                                OmeroReader reader, IFormatWriter writer,
+                                BackgroundTiffWriter backgroundWriter) {
                             try {
                                 if (raw != null) {
                                     raw.close();
@@ -448,6 +514,14 @@ public class ExporterI extends AbstractAmdServant implements
                                 }
                             } catch (Exception e) {
                                 log.error("Error closing reader", e);
+                            }
+                            try {
+                                if (backgroundWriter != null) {
+                                	backgroundWriter.shutdown();
+                                	backgroundWriter = null;
+                                }
+                            } catch (Exception e) {
+                                log.error("Error closing background writer", e);
                             }
                             try {
                                 if (writer != null) {
